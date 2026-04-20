@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Large local ML assets (use pip/conda or Docker build to obtain)
+**/*.dat
+face_recognition_project/encodings.pickle
+
+# Local enrollment photos (do not publish to public GitHub)
+face_recognition_project/students/
