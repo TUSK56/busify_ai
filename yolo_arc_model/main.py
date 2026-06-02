@@ -141,10 +141,17 @@ def _bgr_from_bytes(raw: bytes) -> np.ndarray | None:
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def _largest_face_box(img: np.ndarray) -> tuple[int, int, int, int] | None:
-    min_conf = float(os.environ.get("FACE_MIN_DET_SCORE", "0.50"))
-    results = _get_yolo()(img, verbose=False)
-    best: tuple[float, int, int, int, int] | None = None
+def _largest_face_box(
+    img: np.ndarray, *, min_confidence: float | None = None
+) -> tuple[tuple[int, int, int, int], float] | None:
+    """Return padded box and YOLO confidence for the largest face."""
+    min_conf = (
+        float(min_confidence)
+        if min_confidence is not None
+        else float(os.environ.get("FACE_MIN_DET_SCORE", "0.50"))
+    )
+    results = _get_yolo()(img, imgsz=640, verbose=False)
+    best: tuple[float, float, int, int, int, int] | None = None
     for result in results:
         boxes = getattr(result, "boxes", None)
         if boxes is None or len(boxes) == 0:
@@ -156,58 +163,93 @@ def _largest_face_box(img: np.ndarray) -> tuple[int, int, int, int] | None:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             area = float((x2 - x1) * (y2 - y1))
             if best is None or area > best[0]:
-                best = (area, x1, y1, x2, y2)
+                best = (area, conf, x1, y1, x2, y2)
     if best is None:
         return None
-    _, x1, y1, x2, y2 = best
+    _, det_conf, x1, y1, x2, y2 = best
     h, w = img.shape[:2]
     pad_x = int((x2 - x1) * 0.10)
     pad_y = int((y2 - y1) * 0.10)
-    return (
+    box = (
         max(0, x1 - pad_x),
         max(0, y1 - pad_y),
         min(w, x2 + pad_x),
         min(h, y2 + pad_y),
     )
+    return box, det_conf
 
 
-def _extract_face_crop(img: np.ndarray) -> np.ndarray:
-    # Step 1: GFPGAN (local or QUALITY_API_URL Space)
+def light_normalize_crop(face_bgr: np.ndarray) -> np.ndarray:
+    """Light brightness correction after GFPGAN/YOLO — only extreme cases."""
+    mean_brightness = float(np.mean(face_bgr))
+    if mean_brightness > 200 or mean_brightness < 50:
+        gamma = 0.7 if mean_brightness > 200 else 1.3
+        inv_gamma = 1.0 / gamma
+        table = np.array(
+            [((i / 255.0) ** inv_gamma) * 255 for i in range(256)],
+            dtype=np.uint8,
+        )
+        return cv2.LUT(face_bgr, table)
+    return face_bgr
+
+
+def _extract_face_crop(
+    img: np.ndarray, *, min_yolo_confidence: float | None = None
+) -> tuple[np.ndarray, float]:
+    """GFPGAN (unchanged) → YOLO crop. Returns (crop, yolo_confidence)."""
     prepared = prepare_image_for_face_pipeline(img)
-    # Step 2: YOLO on CLAHE-aided frame for detection
     detect_view = _enhance_image(prepared)
-    box = _largest_face_box(detect_view)
-    if box is None:
-        box = _largest_face_box(prepared)
-    if box is None:
-        box = _largest_face_box(img)
-    if box is None:
+    found = _largest_face_box(detect_view, min_confidence=min_yolo_confidence)
+    if found is None:
+        found = _largest_face_box(prepared, min_confidence=min_yolo_confidence)
+    if found is None:
+        found = _largest_face_box(img, min_confidence=min_yolo_confidence)
+    if found is None:
         raise ValueError("no_face_detected")
+    box, det_conf = found
     x1, y1, x2, y2 = box
-    return prepared[y1:y2, x1:x2].copy()
+    return prepared[y1:y2, x1:x2].copy(), det_conf
 
 
-def _quality_reject_reason(face_bgr: np.ndarray) -> str | None:
-    min_px = int(os.environ.get("FACE_MIN_CROP_PX", "60"))
-    h, w = face_bgr.shape[:2]
-    if min(h, w) < min_px:
-        return "face_too_small"
-    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+def _enrollment_quality_gate(face_crop: np.ndarray, yolo_confidence: float) -> None:
+    """Stricter gates for parent enrollment only (after GFPGAN + YOLO)."""
+    h, w = face_crop.shape[:2]
+    if min(h, w) < 80:
+        raise HTTPException(
+            status_code=400,
+            detail="Face crop too small. Please scan closer to the camera.",
+        )
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
     blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    max_blur = float(os.environ.get("FACE_MAX_BLUR_VAR", "20.0"))
-    if blur_var < max_blur:
-        return "face_too_blurry"
-    return None
+    if blur_var < 40.0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Image is still unclear after enhancement. "
+                "Please scan in better lighting."
+            ),
+        )
+    if yolo_confidence < 0.70:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Face not clearly detected. Please face the camera directly "
+                "in good lighting."
+            ),
+        )
 
 
-def _arcface_embedding_from_crop(face_bgr: np.ndarray) -> np.ndarray:
+def _arcface_embedding_from_crop(
+    face_bgr: np.ndarray, *, apply_crop_clahe: bool = True
+) -> np.ndarray:
     try:
         from deepface import DeepFace
     except ImportError as exc:
         raise HTTPException(status_code=500, detail="deepface not installed") from exc
     if face_bgr.size == 0:
         raise ValueError("no_face_detected")
-    face_bgr = _enhance_face_crop(face_bgr)
+    if apply_crop_clahe:
+        face_bgr = _enhance_face_crop(face_bgr)
     rows = DeepFace.represent(
         img_path=face_bgr,
         model_name=_arcface_model_name,
@@ -224,48 +266,42 @@ def _arcface_embedding_from_crop(face_bgr: np.ndarray) -> np.ndarray:
     return emb / norm
 
 
-def _augmented_crops(face_bgr: np.ndarray, n: int) -> list[np.ndarray]:
-    """Deterministic scale/position variations (seed=42)."""
+def extract_single_embedding(face_bgr: np.ndarray) -> np.ndarray:
+    """ArcFace on one crop (enrollment augment path; no extra CLAHE)."""
+    normalized = light_normalize_crop(face_bgr)
+    return _arcface_embedding_from_crop(normalized, apply_crop_clahe=False)
+
+
+def averaged_enrollment_embedding(face_bgr: np.ndarray, n_augments: int = 5) -> np.ndarray:
+    """Five scale variations on the GFPGAN+YOLO crop → mean → L2 normalize."""
     rng = np.random.default_rng(42)
     h, w = face_bgr.shape[:2]
-    crops: list[np.ndarray] = [face_bgr]
-    for _ in range(max(0, n - 1)):
+    embeddings: list[np.ndarray] = []
+    for _ in range(n_augments):
         scale = float(rng.uniform(0.92, 1.08))
         nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
         scaled = cv2.resize(face_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        sh, sw = scaled.shape[:2]
-        if sh > h or sw > w:
-            y0 = max(0, (sh - h) // 2)
-            x0 = max(0, (sw - w) // 2)
-            crop = scaled[y0 : y0 + h, x0 : x0 + w]
-        else:
-            crop = np.zeros((h, w, 3), dtype=face_bgr.dtype)
-            y0 = (h - sh) // 2
-            x0 = (w - sw) // 2
-            crop[y0 : y0 + sh, x0 : x0 + sw] = scaled
-        crops.append(crop)
-    return crops
-
-
-def _averaged_embedding(face_bgr: np.ndarray) -> np.ndarray:
-    n = int(os.environ.get("FACE_N_AUGMENTS", "5"))
-    crops = _augmented_crops(face_bgr, n)
-    vectors = [_arcface_embedding_from_crop(c) for c in crops]
-    mean_vec = np.mean(np.stack(vectors, axis=0), axis=0)
+        crop = cv2.resize(scaled, (w, h), interpolation=cv2.INTER_LINEAR)
+        embeddings.append(extract_single_embedding(crop))
+    mean_vec = np.mean(np.stack(embeddings, axis=0), axis=0)
     norm = float(np.linalg.norm(mean_vec))
     if norm < 1e-6:
         raise ValueError("no_face_detected")
     return (mean_vec / norm).astype(np.float32)
 
 
-def _embedding_from_bgr(img: np.ndarray, *, augment: bool) -> np.ndarray:
-    face = _extract_face_crop(img)
-    reason = _quality_reject_reason(face)
-    if reason is not None:
-        raise ValueError(f"low_quality:{reason}")
-    if augment:
-        return _averaged_embedding(face)
-    return _arcface_embedding_from_crop(face)
+def _embedding_enrollment(img: np.ndarray) -> np.ndarray:
+    face, yolo_conf = _extract_face_crop(img, min_yolo_confidence=0.70)
+    _enrollment_quality_gate(face, yolo_conf)
+    face = light_normalize_crop(face)
+    return averaged_enrollment_embedding(face)
+
+
+def _embedding_match(img: np.ndarray) -> np.ndarray:
+    """Scan/match: GFPGAN → YOLO → light normalize → single ArcFace embedding."""
+    face, _ = _extract_face_crop(img)
+    face = light_normalize_crop(face)
+    return _arcface_embedding_from_crop(face, apply_crop_clahe=False)
 
 
 def _accept_similarity(candidate_count: int) -> float:
@@ -309,7 +345,9 @@ async def embed(file: UploadFile = File(...)) -> dict[str, Any]:
     if img is None:
         raise HTTPException(status_code=400, detail="invalid_image")
     try:
-        vec = _embedding_from_bgr(img, augment=True)
+        vec = _embedding_enrollment(img)
+    except HTTPException:
+        raise
     except ValueError as exc:
         msg = str(exc)
         if msg == "no_face_detected":
@@ -317,13 +355,6 @@ async def embed(file: UploadFile = File(...)) -> dict[str, Any]:
                 "dimensions": 0,
                 "embedding": [],
                 "status": "no_face_detected",
-            }
-        if msg.startswith("low_quality:"):
-            return {
-                "dimensions": 0,
-                "embedding": [],
-                "status": "low_quality",
-                "reason": msg.split(":", 1)[1],
             }
         raise HTTPException(status_code=422, detail=msg) from exc
     return {
@@ -360,7 +391,7 @@ async def match(body: MatchBody) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="invalid_image")
 
     try:
-        probe = _embedding_from_bgr(img, augment=False).astype(np.float64)
+        probe = _embedding_match(img).astype(np.float64)
     except ValueError as exc:
         if str(exc) == "no_face_detected":
             return {
